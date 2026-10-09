@@ -182,6 +182,8 @@ const (
 	numJoins                    = "num_joins"
 	numIgnoredJoins             = "num_ignored_joins"
 	numRemovedBeforeJoins       = "num_removed_before_joins"
+	numDemotes                  = "num_demotes"
+	numIgnoredDemotes           = "num_ignored_demotes"
 	numDBStatsErrors            = "num_db_stats_errors"
 	numVerifyLeader             = "num_verify_leader"
 	numVerifyLeaderFailed       = "num_verify_leader_failed"
@@ -248,6 +250,8 @@ func ResetStats() {
 	stats.Add(numJoins, 0)
 	stats.Add(numIgnoredJoins, 0)
 	stats.Add(numRemovedBeforeJoins, 0)
+	stats.Add(numDemotes, 0)
+	stats.Add(numIgnoredDemotes, 0)
 	stats.Add(numDBStatsErrors, 0)
 	stats.Add(numVerifyLeader, 0)
 	stats.Add(numVerifyLeaderFailed, 0)
@@ -891,19 +895,29 @@ func (s *Store) Bootstrap(servers ...*Server) error {
 // getServerAddressByID returns the server address for the given server ID.
 // It returns an error if the server ID is not found in the cluster configuration.
 func (s *Store) getServerAddressByID(id string) (raft.ServerAddress, error) {
+	server, err := s.getServerByID(id)
+	if err != nil {
+		return "", err
+	}
+	return server.Address, nil
+}
+
+// getServerByID returns the Raft configuration entry for the node with the
+// given ID. ErrNodeNotFound is returned if no such node is in the cluster.
+func (s *Store) getServerByID(id string) (raft.Server, error) {
 	configFuture := s.raft.GetConfiguration()
 	if configFuture.Error() != nil {
-		return "", configFuture.Error()
+		return raft.Server{}, configFuture.Error()
 	}
 
 	config := configFuture.Configuration()
 	for _, server := range config.Servers {
 		if string(server.ID) == id {
-			return server.Address, nil
+			return server, nil
 		}
 	}
 
-	return "", ErrNodeNotFound
+	return raft.Server{}, ErrNodeNotFound
 }
 
 // Stepdown forces this node to relinquish leadership to another node in
@@ -2224,6 +2238,48 @@ func (s *Store) Remove(ctx context.Context, rn *proto.RemoveNodeRequest) error {
 	return nil
 }
 
+// Demote demotes a voting node to a non-voting node. The node remains a
+// member of the cluster and continues to receive replicated log entries,
+// but no longer participates in elections or log commitment. Only the
+// Leader can demote a node. If the node is not a member of the cluster,
+// ErrNodeNotFound is returned. Demoting a node which is already a
+// non-voter is a no-op.
+func (s *Store) Demote(ctx context.Context, dn *proto.DemoteNodeRequest) error {
+	if !s.open.Is() {
+		return ErrNotOpen
+	}
+
+	// Check if context is already canceled
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	if s.raft.State() != raft.Leader {
+		return ErrNotLeader
+	}
+
+	id := dn.Id
+	s.logger.Printf("received request to demote node %s", id)
+
+	server, err := s.getServerByID(id)
+	if err != nil {
+		return err
+	}
+	if server.Suffrage != raft.Voter {
+		stats.Add(numIgnoredDemotes, 1)
+		s.logger.Printf("node %s is already a non-voter, ignoring demote request", id)
+		return nil
+	}
+
+	if err := s.demote(id); err != nil {
+		return err
+	}
+
+	stats.Add(numDemotes, 1)
+	s.logger.Printf("node %s demoted successfully", id)
+	return nil
+}
+
 // Noop writes a noop command to the Raft log. A noop command simply
 // consumes a slot in the Raft log, but has no other effect on the
 // system.
@@ -2278,6 +2334,15 @@ func (s *Store) StagedWALs() ([]string, error) {
 // remove removes the node, with the given ID, from the cluster.
 func (s *Store) remove(id string) error {
 	f := s.raft.RemoveServer(raft.ServerID(id), 0, 0)
+	if f.Error() != nil && f.Error() == raft.ErrNotLeader {
+		return ErrNotLeader
+	}
+	return f.Error()
+}
+
+// demote demotes the node, with the given ID, from a voter to a non-voter.
+func (s *Store) demote(id string) error {
+	f := s.raft.DemoteVoter(raft.ServerID(id), 0, 0)
 	if f.Error() != nil && f.Error() == raft.ErrNotLeader {
 		return ErrNotLeader
 	}
